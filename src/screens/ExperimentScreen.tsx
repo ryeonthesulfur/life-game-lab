@@ -29,6 +29,12 @@ export function ExperimentScreen({ lab }: { lab: Lab }) {
           onStrokeStart={lab.onStrokeStart}
           onPaint={lab.paint}
           onStrokeEnd={lab.onStrokeEnd}
+          mode={lab.mode}
+          edge={lab.edge}
+          selection={lab.selection}
+          selectable={!lab.running}
+          onSelect={lab.select}
+          onMoveSelection={lab.moveSelection}
         />
       </div>
 
@@ -37,12 +43,32 @@ export function ExperimentScreen({ lab }: { lab: Lab }) {
           <button className="primary play" onClick={lab.togglePlay}>
             {lab.running ? '⏸ 停止' : '▶ 再生'}
           </button>
+          <button onClick={lab.stepBack} disabled={lab.running || !lab.canStepBack}>1ターン戻す</button>
           <button onClick={lab.stepOnce} disabled={lab.running}>1ターン進める</button>
           <label className="slider">
             速さ
             <input type="range" min={1} max={60} value={lab.speed} onChange={(e) => lab.setSpeed(Number(e.target.value))} />
             <span className="value">{lab.speed}ターン/秒</span>
           </label>
+        </div>
+
+        <div className="row">
+          <fieldset>
+            <legend>操作</legend>
+            <label><input type="radio" checked={lab.mode === 'draw'} onChange={() => lab.setMode('draw')} />描く</label>
+            <label><input type="radio" checked={lab.mode === 'select'} onChange={() => lab.setMode('select')} />選択</label>
+          </fieldset>
+          {lab.mode === 'select' && (
+            <>
+              <button onClick={lab.duplicateSelection} disabled={lab.running || !lab.selection}>複製</button>
+              <button onClick={lab.rotateSelection} disabled={lab.running || !lab.selection}>右に回転</button>
+              <button onClick={() => lab.flipSelection('horizontal')} disabled={lab.running || !lab.selection}>左右反転</button>
+              <button onClick={() => lab.flipSelection('vertical')} disabled={lab.running || !lab.selection}>上下反転</button>
+              <span className="hint">
+                {lab.running ? '一時停止中に使えます' : lab.selection ? '枠の中をドラッグで移動' : '盤面をドラッグして囲む'}
+              </span>
+            </>
+          )}
         </div>
 
         <div className="row">

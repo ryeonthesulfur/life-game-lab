@@ -8,6 +8,7 @@ import { formatDateTime, downloadText, safeFilename } from './download'
 import {
   boardAsPattern,
   clearBoard,
+  cloneBoard,
   countPopulation,
   createBoard,
   extractPattern,
@@ -24,9 +25,28 @@ import {
 import { parsePlaintext } from './life/plaintext'
 import { PRESETS } from './life/presets'
 import { encodeRLE, isConwayRule, parseRLE } from './life/rle'
+import {
+  clearRect,
+  duplicateRect,
+  flipHorizontal,
+  flipVertical,
+  hasLife,
+  placeRect,
+  readRect,
+  rotatedRect,
+  rotateRight,
+  stamp,
+  trimToLife,
+  type Rect,
+} from './life/selection'
 import { StatusTracker, statusText } from './life/status'
 
 export const CELL_SIZES = [2, 3, 4, 5, 6, 8, 10, 12, 16, 20]
+
+/** 「1ターン戻す」で戻れる手の数 */
+const UNDO_LIMIT = 100
+
+export type BoardMode = 'draw' | 'select'
 
 type SourcePart = { type: SourceType; detail: string }
 
@@ -48,6 +68,20 @@ type Session = {
   /** 全滅・固定の確認を出したか */
   endAsked: boolean
   /** 周期のお知らせを出したか */
+  periodNotified: boolean
+}
+
+/** 1手前に戻すための控え。盤面と、記録用データのうち手ごとに変わる部分 */
+type UndoEntry = {
+  cells: Uint8Array
+  generation: number
+  initialPattern: string | null
+  initialPopulation: number
+  maxPopulation: number
+  maxPopulationGen: number
+  historyLength: number
+  parts: SourcePart[]
+  endAsked: boolean
   periodNotified: boolean
 }
 
@@ -88,6 +122,9 @@ function autoTitle(parts: SourcePart[]): string {
   return `${label} ${formatDateTime(new Date().toISOString()).slice(5)}`
 }
 
+/** 選択枠の中身をそのまま使う（移動・複製） */
+const same = (p: Pattern) => p
+
 function parsePatternFile(name: string, text: string): Pattern {
   if (/\.cells$/i.test(name)) return parsePlaintext(text)
   if (/\.rle$/i.test(name)) return parseRLE(text)
@@ -107,12 +144,15 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
   const [cellSize, setCellSize] = useState(GRID_SIZES.small.cellSize)
   const [inverted, setInverted] = useState(false)
   const [version, setVersion] = useState(0)
+  const [mode, setModeState] = useState<BoardMode>('draw')
+  const [selection, setSelection] = useState<Rect | null>(null)
 
   const boardRef = useRef<Board>(createBoard(GRID_SIZES.small.width, GRID_SIZES.small.height))
   const spareRef = useRef<Board>(createBoard(GRID_SIZES.small.width, GRID_SIZES.small.height))
   const trackerRef = useRef(new StatusTracker())
   const sessionRef = useRef<Session>(newSession())
   const edgeRef = useRef<EdgeMode>('wrap')
+  const undoRef = useRef<UndoEntry[]>([])
 
   const redraw = useCallback(() => setVersion((v) => v + 1), [])
 
@@ -124,17 +164,45 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
     if (sessionRef.current.generation > 0) trackerRef.current.observe(boardRef.current, sessionRef.current.generation)
   }, [])
 
+  /** 盤面がリセットされたときに、戻せる手と選択枠を捨てる */
+  const forgetHistory = useCallback(() => {
+    undoRef.current = []
+    setSelection(null)
+  }, [])
+
   const replaceBoard = useCallback((key: GridSizeKey) => {
     const s = GRID_SIZES[key]
     boardRef.current = createBoard(s.width, s.height)
     spareRef.current = createBoard(s.width, s.height)
     setSize(key)
     setCellSize(s.cellSize)
-  }, [])
+    forgetHistory()
+  }, [forgetHistory])
 
   const startNewSession = useCallback(() => {
     sessionRef.current = newSession()
     trackerRef.current.reset()
+    forgetHistory()
+  }, [forgetHistory])
+
+  // ---- 1ターン戻す ----
+
+  /** 盤面を変える直前に呼び、今の状態を控えておく */
+  const pushUndo = useCallback(() => {
+    const s = sessionRef.current
+    undoRef.current.push({
+      cells: boardRef.current.cells.slice(),
+      generation: s.generation,
+      initialPattern: s.initialPattern,
+      initialPopulation: s.initialPopulation,
+      maxPopulation: s.maxPopulation,
+      maxPopulationGen: s.maxPopulationGen,
+      historyLength: s.history.length,
+      parts: [...s.parts],
+      endAsked: s.endAsked,
+      periodNotified: s.periodNotified,
+    })
+    if (undoRef.current.length > UNDO_LIMIT) undoRef.current.shift()
   }, [])
 
   // ---- 記録 ----
@@ -220,6 +288,7 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
   const advance = useCallback(() => {
     const s = sessionRef.current
     const tracker = trackerRef.current
+    pushUndo()
     if (s.generation === 0) {
       const population = countPopulation(boardRef.current)
       s.initialPattern = encodeRLE(boardAsPattern(boardRef.current))
@@ -242,7 +311,7 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
       s.maxPopulationGen = s.generation
     }
     return tracker.observe(next, s.generation)
-  }, [])
+  }, [pushUndo])
 
   /** 進めたあとの結末チェック。止めたら true */
   const checkEnding = useCallback((): boolean => {
@@ -289,7 +358,11 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
 
   const togglePlay = useCallback(() => {
     if (running) setRunning(false)
-    else if (canStart()) setRunning(true)
+    else if (canStart()) {
+      // 再生すると、選択枠はその時点の配置で確定する
+      setSelection(null)
+      setRunning(true)
+    }
   }, [running, canStart])
 
   const stepOnce = useCallback(() => {
@@ -298,6 +371,27 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
     checkEnding()
     redraw()
   }, [running, canStart, advance, checkEnding, redraw])
+
+  const stepBack = useCallback(() => {
+    if (running) return
+    const entry = undoRef.current.pop()
+    if (!entry) return
+    boardRef.current.cells.set(entry.cells)
+    const s = sessionRef.current
+    s.generation = entry.generation
+    s.initialPattern = entry.initialPattern
+    s.initialPopulation = entry.initialPopulation
+    s.maxPopulation = entry.maxPopulation
+    s.maxPopulationGen = entry.maxPopulationGen
+    s.history.length = entry.historyLength
+    s.parts = entry.parts
+    s.endAsked = entry.endAsked
+    s.periodNotified = entry.periodNotified
+    s.dirty = true
+    resetTracker()
+    setSelection(null)
+    redraw()
+  }, [running, resetTracker, redraw])
 
   // 再生中は、速さ（ターン/秒）に合わせて進める
   useEffect(() => {
@@ -348,7 +442,10 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
     }
   }, [])
 
-  const onStrokeStart = useCallback(() => addPart({ type: 'manual', detail: '' }), [addPart])
+  const onStrokeStart = useCallback(() => {
+    pushUndo()
+    addPart({ type: 'manual', detail: '' })
+  }, [pushUndo, addPart])
 
   const paint = useCallback((x: number, y: number, alive: boolean) => {
     const b = boardRef.current
@@ -384,10 +481,84 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
   const placePreset = useCallback((id: string) => {
     const preset = PRESETS.find((p) => p.id === id)
     if (!preset) return
+    pushUndo()
     addPart({ type: 'preset', detail: preset.name })
     placePattern(boardRef.current, parseRLE(preset.rle))
     afterEdit()
-  }, [addPart, afterEdit])
+  }, [pushUndo, addPart, afterEdit])
+
+  // ---- 選択モード ----
+
+  const setMode = useCallback((next: BoardMode) => {
+    setModeState(next)
+    setSelection(null)
+  }, [])
+
+  /** 囲んだ範囲を、住人がちょうど収まる枠にする。住人がいなければ枠を消す */
+  const select = useCallback((rect: Rect | null) => {
+    setSelection(rect && trimToLife(boardRef.current, rect))
+  }, [])
+
+  /**
+   * 選択枠の中身を make で変えて target に置く。
+   * 置く先にほかの住人がいれば確認を出す。keepSource なら元の場所は残す（複製）
+   */
+  const applySelection = useCallback(async (
+    target: Rect | null,
+    make: (p: Pattern) => Pattern,
+    { keepSource = false, failMessage = '' } = {},
+  ) => {
+    if (running || !selection) return
+    if (!target) {
+      showToast(failMessage)
+      return
+    }
+    const board = boardRef.current
+    const content = make(readRect(board, selection))
+    const next = cloneBoard(board)
+    if (!keepSource) clearRect(next, selection)
+    if (hasLife(next, target)) {
+      const res = await ask({
+        message: '重なってしまいますがよろしいですか？',
+        buttons: [
+          { label: 'いいえ', value: 'cancel' },
+          { label: 'はい', value: 'ok', kind: 'primary' },
+        ],
+      })
+      if (res.value !== 'ok') return
+    }
+    pushUndo()
+    stamp(next, content, target.x, target.y)
+    board.cells.set(next.cells)
+    setSelection(target)
+    afterEdit()
+  }, [running, selection, ask, showToast, pushUndo, afterEdit])
+
+  const moveSelection = useCallback((dx: number, dy: number) => {
+    if (!selection) return
+    const target = placeRect(boardRef.current, { ...selection, x: selection.x + dx, y: selection.y + dy }, edgeRef.current)
+    if (target && target.x === selection.x && target.y === selection.y) return
+    void applySelection(target, same)
+  }, [selection, applySelection])
+
+  const duplicateSelection = useCallback(() => {
+    if (!selection) return
+    void applySelection(duplicateRect(boardRef.current, selection, edgeRef.current), same, {
+      keepSource: true,
+      failMessage: 'これ以上右に複製できません',
+    })
+  }, [selection, applySelection])
+
+  const rotateSelection = useCallback(() => {
+    if (!selection) return
+    void applySelection(placeRect(boardRef.current, rotatedRect(selection), edgeRef.current), rotateRight, {
+      failMessage: '盤面に入りきらないので回転できません',
+    })
+  }, [selection, applySelection])
+
+  const flipSelection = useCallback((direction: 'horizontal' | 'vertical') => {
+    void applySelection(selection, direction === 'horizontal' ? flipHorizontal : flipVertical)
+  }, [selection, applySelection])
 
   const setEdge = useCallback((mode: EdgeMode) => {
     edgeRef.current = mode
@@ -521,6 +692,8 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
     version,
     size,
     edge,
+    mode,
+    selection,
     running,
     speed,
     density,
@@ -538,6 +711,8 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
     setInverted,
     togglePlay,
     stepOnce,
+    stepBack,
+    canStepBack: undoRef.current.length > 0,
     clear,
     random,
     changeSize,
@@ -549,6 +724,12 @@ export function useLab(ask: AskFn, showToast: ShowToastFn) {
     onStrokeStart,
     paint,
     onStrokeEnd: afterEdit,
+    setMode,
+    select,
+    moveSelection,
+    duplicateSelection,
+    rotateSelection,
+    flipSelection,
     restartFrom,
     continueFrom,
   }

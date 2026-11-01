@@ -182,6 +182,11 @@ input:not([type]) {
   font-variant-numeric: tabular-nums;
 }
 
+.controls .hint {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
 fieldset {
   display: inline-flex;
   align-items: center;
